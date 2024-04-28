@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.pyright]
+reportUnnecessaryTypeIgnoreComment = "warning"
+reportUnsupportedDunderAll = "none"
+pythonVersion = "3.8"
+typeCheckingMode = "basic"
+
+[tool.black]
+line-length = 125
+
+[tool.isort]
+profile = "black"
+combine_as_imports = true
+combine_star = true
+line_length = 125
