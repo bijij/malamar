@@ -1,8 +1,31 @@
 from __future__ import annotations
 
 from abc import ABCMeta, abstractmethod
+from typing import Protocol, runtime_checkable
 
-__all__ = ("Service",)
+__all__ = ("Service", "ServiceProto")
+
+
+@runtime_checkable
+class ServiceProto(Protocol):
+    """Protocol for services.
+
+    .. note::
+        This protocol is used to allow for additional flexibility when defining services.
+        In most cases, you should inherit from :class:`Service` instead.
+    """
+
+    async def _start(self) -> None: ...
+
+    """Method called when the service is started."""
+
+    def _register(self) -> None: ...
+
+    """Method called when the service is registered."""
+
+    async def _stop(self) -> None: ...
+
+    """Method called when the service is stopped."""
 
 
 class Service(metaclass=ABCMeta):
@@ -13,7 +36,7 @@ class Service(metaclass=ABCMeta):
 
     @abstractmethod
     async def start(self) -> None:
-        """Called when the service is started."""
+        """Called when the service is started, this method should be overridden to implement the service logic."""
         pass
 
     def _register(self) -> None:
@@ -32,7 +55,7 @@ class Service(metaclass=ABCMeta):
 
     @abstractmethod
     async def stop(self) -> None:
-        """Called when the service is stopped."""
+        """Called when the service is stopped, this method should be overridden to implement the service cleanup logic."""
         pass
 
     async def _stop(self) -> None:

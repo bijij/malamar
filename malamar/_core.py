@@ -4,11 +4,12 @@ import asyncio
 import builtins
 import inspect
 from collections import defaultdict
-from collections.abc import Awaitable, Callable, Iterable
-from typing import TYPE_CHECKING, Any, Literal, TypeVar, get_type_hints, overload
+from collections.abc import Callable, Iterable
+from typing import TYPE_CHECKING, Any, TypeVar, get_type_hints, overload
 
-from .service import Service
-from .utils import MISSING
+from ._service import ServiceProto
+from ._utils import MISSING
+from .services import ApplicationLifetime
 
 if TYPE_CHECKING:
     from typing_extensions import Self
@@ -19,10 +20,17 @@ __all__ = (
 )
 
 T = TypeVar("T")
-T_SVC = TypeVar("T_SVC", bound=Service)
+T_SVC = TypeVar("T_SVC", bound=ServiceProto)
 
 
 def _get_dependencies(cls: type) -> list[type]:
+    """Get the dependencies of a class.
+
+    Parameters
+    ----------
+    cls: :class:`type`
+        The class to get the dependencies of.
+    """
     if cls.__init__ is object.__init__:
         return []
 
@@ -43,69 +51,16 @@ def _get_dependencies(cls: type) -> list[type]:
     return dependencies
 
 
-class ApplicationLifetime(Service):
-    """Provides application lifetime event handling and control.
-
-    .. Note::
-
-        This class is automatically registered with the application as a required service.
-    """
-
-    def __init__(self, app: Application) -> None:
-        self._app: Application = app
-        self._started: asyncio.Event = asyncio.Event()
-        self._stopping: asyncio.Event = asyncio.Event()
-
-    async def start(self) -> None:
-        self._started.set()
-
-    async def stop(self) -> None:
-        self._stopping.set()
-        await self._app.wait()
-        self._started.clear()
-        self._stopping.clear()
-
-    @property
-    def started(self) -> Awaitable[Literal[True]]:
-        """|coroprop|
-
-        An awaitable that resolves when the application has started.
-        """
-        return self._started.wait()
-
-    @property
-    def stopping(self) -> Awaitable[Literal[True]]:
-        """|coroprop|
-
-        An awaitable that resolves when the application is stopping.
-        """
-        return self._stopping.wait()
-
-    @property
-    def stopped(self) -> Awaitable[None]:
-        """|coroprop|
-
-        An awaitable that resolves when the application has stopped.
-        """
-        return self._app.wait()
-
-    async def stop_application(self) -> None:
-        """|coro|
-
-        Signals for the application to stop.
-        """
-        await self._app.stop()
-
-
 class Application:
     """The class responsible for managing the application and its services."""
 
     def __init__(self):
+        """Creates a new Application instance."""
         self._singletons: dict[type[Any], Any] = {}
         self._transients: dict[type[Any], type[Any]] = {}
         # scoped? ContextVar?
-        self._required_services: dict[type[Service], Service] = {}
-        self._services: dict[type[Service], list[Service]] = defaultdict(list)
+        self._required_services: dict[type[ServiceProto], ServiceProto] = {}
+        self._services: dict[type[ServiceProto], list[ServiceProto]] = defaultdict(list)
         self._stopped: asyncio.Event = asyncio.Event()
         self._stopped.set()
 
@@ -124,11 +79,17 @@ class Application:
                 raise ValueError(f"Unknown dependency: {dependency}")
         return dependencies
 
-    def _create_instance(self, cls: type[T] | T, *, type: type[T] | None = None) -> tuple[T, type[T]]:
+    def _create_instance(
+        self, cls: type[T] | T, *, type: type[T] | None = None, base: type[Any] | None = None
+    ) -> tuple[T, type[T]]:
         if type is None:
             if not isinstance(cls, builtins.type):
                 raise ValueError("type must be provided for singleton instances")
             type = cls
+
+        if base is not None:
+            if not issubclass(type, base):
+                raise ValueError(f"Type {type} must be a subclass of {base}")
 
         if isinstance(cls, builtins.type):
             dependancies = _get_dependencies(cls)
@@ -191,13 +152,13 @@ class Application:
         type: Optional[:class:`type`]
             The type of the required service. If not provided, the type of the class is used.
         """
-        instance, type = self._create_instance(cls, type=type)
+        instance, type = self._create_instance(cls, type=type, base=ServiceProto)
         self._required_services[type] = instance
         instance._register()
         return self
 
     def _add_service(self, cls: type[T_SVC] | T_SVC, *, type: type[T_SVC] | None) -> Self:
-        instance, type = self._create_instance(cls, type=type)
+        instance, type = self._create_instance(cls, type=type, base=ServiceProto)
         self._services[type].append(instance)
         instance._register()
         return self
@@ -239,10 +200,7 @@ class Application:
         """
         if type not in self._transients:
             raise ValueError(f"Unknown transient type: {type}")
-        (
-            instance,
-            _,
-        ) = self._create_instance(self._transients[type], type=type)
+        instance, _ = self._create_instance(self._transients[type], type=type)
         return instance
 
     def get_required_service(self, type: type[T_SVC]) -> T_SVC:
@@ -355,9 +313,8 @@ class Application:
             asyncio.gather(*coros), timeout=timeout
         )  # TODO: Maybe timeout per service, allows for better debugging
 
-    async def run(self, *, startup_timeout: float | None = None) -> None:
-        """|coro|
-
+    def run(self, *, startup_timeout: float | None = None) -> None:
+        """
         Starts the application and all services, then waits for the application to stop.
 
         .. Note::
@@ -375,8 +332,16 @@ class Application:
         asyncio.TimeoutError
             A service did not start within the specified timeout.
         """
-        await self.start(timeout=startup_timeout)
-        await self.wait()
+
+        async def runner():
+            await self.start(timeout=startup_timeout)
+
+            try:
+                await self.wait()
+            except asyncio.CancelledError:
+                await self.stop()
+
+        asyncio.run(runner())
 
     async def stop(self) -> None:
         """|coro|

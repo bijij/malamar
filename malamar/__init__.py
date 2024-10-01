@@ -1,16 +1,16 @@
 """
 Malamar: Dependency Injection Framework for Python
-
 """
 
 from __future__ import annotations
 
 from typing import NamedTuple
 
-from .core import *
-from .core import __all__ as _core_all
-from .service import *
-from .service import __all__ as _service_all
+from . import services as services
+from ._core import *
+from ._core import __all__ as _core_all
+from ._service import *
+from ._service import __all__ as _service_all
 
 
 class _VersionInfo(NamedTuple):
@@ -29,4 +29,5 @@ __all__ = [
     *_service_all,
     "version",
     "version_info",
+    "services",
 ]
