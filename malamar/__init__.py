@@ -6,7 +6,6 @@ from __future__ import annotations
 
 from typing import NamedTuple
 
-from . import services as services
 from ._core import *
 from ._core import __all__ as _core_all
 from ._service import *
@@ -29,5 +28,4 @@ __all__ = [
     *_service_all,
     "version",
     "version_info",
-    "services",
 ]
