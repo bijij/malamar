@@ -15,17 +15,17 @@ class ServiceProto(Protocol):
         In most cases, you should inherit from :class:`Service` instead.
     """
 
-    async def _start(self) -> None: ...
+    async def _start(self) -> None:
+        """Method called when the service is started."""
+        ...
 
-    """Method called when the service is started."""
+    def _register(self) -> None:
+        """Method called when the service is registered."""
+        ...
 
-    def _register(self) -> None: ...
-
-    """Method called when the service is registered."""
-
-    async def _stop(self) -> None: ...
-
-    """Method called when the service is stopped."""
+    async def _stop(self) -> None:
+        """Method called when the service is stopped."""
+        ...
 
 
 class Service(metaclass=ABCMeta):
