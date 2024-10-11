@@ -3,28 +3,31 @@ from __future__ import annotations
 import asyncio
 import builtins
 import inspect
-from collections.abc import Awaitable, Callable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from contextvars import ContextVar
-from enum import Enum, auto
 from os import urandom
-from typing import TYPE_CHECKING, Any, Literal, TypeVar, get_type_hints, overload
+from typing import TYPE_CHECKING, Any, Literal, NamedTuple, TypeVar, get_args, get_origin, get_type_hints, overload
 
-from ._service import ServiceProto
+from ._service import Service
 from ._utils import MISSING, _get_optional_type
 
 if TYPE_CHECKING:
     from typing_extensions import Self
 
-__all__ = (
-    "Application",
-    "ApplicationState",
-)
+__all__ = ("Application",)
 
 T = TypeVar("T")
-T_SVC = TypeVar("T_SVC", bound=ServiceProto)
+T_SVC = TypeVar("T_SVC", bound=Service)
 
 
-def _get_dependencies(cls: type) -> Sequence[tuple[str | None, type, bool]]:
+class _Dependency(NamedTuple):
+    name: str | None
+    type: type | Sequence[type]
+    required: bool
+    multiple: bool
+
+
+def _get_dependencies(cls: type) -> Sequence[_Dependency]:
     """Get the dependencies of a class.
 
     Parameters
@@ -47,73 +50,110 @@ def _get_dependencies(cls: type) -> Sequence[tuple[str | None, type, bool]]:
         if parameter.name not in annotations:
             raise ValueError(f"Missing type hint for parameter: {parameter}")
 
-        required, type = _get_optional_type(annotations[parameter.name])
+        optional, dependency = _get_optional_type(annotations[parameter.name])
+        multiple = False
+
+        origin = get_origin(dependency)
+        if origin is not None:
+
+            if issubclass(origin, Iterable):
+                multiple = True
+
+            dependency = get_args(dependency)
 
         name = None
         if parameter.kind is inspect.Parameter.KEYWORD_ONLY:
             name = parameter.name
 
-        dependencies.append((name, type, required))
+        dependencies.append(_Dependency(name, dependency, not optional, multiple))
 
     return dependencies
 
 
-class ApplicationState(Enum):
-    """The state of the application."""
-
-    UNKNOWN = auto()
-    """The application is in an unknown state."""
-
-    STARTING = auto()
-    """The application is starting."""
-
-    STARTED = auto()
-    """The application has started."""
-
-    STOPPING = auto()
-    """The application is stopping."""
-
-    STOPPED = auto()
-    """The application has stopped."""
-
-
-class Application:
+class Application(Service):
     """The class responsible for managing the application and its services."""
 
     def __init__(self):
         """Creates a new Application instance."""
-        self._singletons: dict[type[Any], Any] = {Application: self, type(self): self}
+        super().__init__()
+
+        self._singletons: dict[type[Any], Any | list[Any]] = {Application: self, type(self): self}
         self._transients: dict[type[Any], type[Any]] = {}
         self._scoped: dict[type[Any], type[Any]] = {}
         self._contexts: ContextVar[dict[type[Any], Any]] = ContextVar(
             f"malamar.{self.__class__.__name__}.{urandom(16).hex()}.context", default={}
         )
-        self._services: dict[type[ServiceProto], ServiceProto] = {}
+        self._services: dict[type[Service], Service] = {}
 
-        self._lock: asyncio.Lock = asyncio.Lock()
-        self._starting: asyncio.Event = asyncio.Event()
-        self._started: asyncio.Event = asyncio.Event()
-        self._stopping: asyncio.Event = asyncio.Event()
-        self._stopped: asyncio.Event = asyncio.Event()
+    async def start(self, *, timeout: float | None = None) -> None:
+        """|coro|
 
-        self._stopped.set()
+        Starts the application and all services.
 
-    def _resolve_dependencies(
-        self, types: Sequence[tuple[str | None, type, bool]]
-    ) -> tuple[Sequence[Any], Mapping[str, Any]]:
+        Parameters
+        ----------
+        timeout: Optional[:class:`float`]
+            The maximum number of seconds to allow for all services to start.
+            If ``None``, no timeout is applied.
+
+        Raises
+        ------
+        asyncio.TimeoutError
+            A service did not start within the specified timeout.
+        """
+        coros = []
+        for service in self._services.values():
+            coros.append(service.start())
+
+        await asyncio.gather(*coros)
+
+    async def stop(self, *, timeout: float | None = None) -> None:
+        """|coro|
+
+        Stops the application and all services.
+
+        .. Warning::
+
+            Exceptions raised by stopping services are discarded.
+        """
+        coros = []
+        for service in self._services.values():
+            coros.append(service.stop())
+
+        await asyncio.gather(*coros)
+
+    def _resolve_dependency(self, type: type, multiple: bool) -> Any | None:
+        dependency = None
+        if type in self._singletons:
+            if multiple:
+                dependency = self.get_singletons(type)
+            else:
+                dependency = self.get_singleton(type)
+        elif type in self._transients:
+            dependency = self.get_transient(self._transients[type])
+        elif type in self._scoped:
+            dependency = self.get_scoped(type)
+        elif type in self._services:
+            dependency = self.get_service(type)
+
+        return dependency
+
+    def _resolve_dependencies(self, types: Sequence[_Dependency]) -> tuple[Sequence[Any], Mapping[str, Any]]:
         dependencies = ([], {})
-        for name, type, required in types:
+        for dependency in types:
+            name, idk, required, multiple = dependency
+
             resolved = None
-            if type in self._singletons:
-                resolved = self.get_singleton(type, required=required)
-            elif type in self._transients:
-                resolved = self.get_transient(self._transients[type], required=required)
-            elif type in self._scoped:
-                resolved = self.get_scoped(type, required=required)
-            elif type in self._services:
-                resolved = self.get_service(type, required=required)
-            elif required:
-                raise ValueError(f"Unknown dependency: {type}")
+            if not isinstance(idk, Sequence):
+                idk = [idk]
+
+            for type in idk:
+                resolved = self._resolve_dependency(type, multiple=multiple)
+                if resolved is not None:
+                    break
+            else:
+                if required:
+                    raise ValueError(f"Required dependency not found: {dependency.type}")
 
             if name is None:
                 dependencies[0].append(resolved)
@@ -163,7 +203,13 @@ class Application:
             The type of the singleton. If not provided, the type of the class is used.
         """
         instance, type = self._create_instance(cls, type=type)
-        self._singletons[type] = instance
+        if type in self._singletons:
+            if isinstance(self._singletons[type], list):
+                self._singletons[type].append(instance)
+            else:
+                self._singletons[type] = [self._singletons[type], instance]
+        else:
+            self._singletons[type] = instance
         return self
 
     def add_transient(self, cls: type, *, type: type | None = None) -> Self:
@@ -216,16 +262,16 @@ class Application:
         type: Optional[:class:`type`]
             The type of the service. If not provided, the type of the class is used.
         """
-        instance, type = self._create_instance(cls, type=type, base=ServiceProto)
+        instance, type = self._create_instance(cls, type=type, base=Service)
         self._services[type] = instance
-        instance._register()
+        # instance._register()
         return self
 
     @overload
-    def get_transient(self, type: type[T], /, *, required: Literal[True]) -> T: ...
+    def get_singleton(self, type: type[T], /, *, required: Literal[True]) -> T: ...
 
     @overload
-    def get_transient(self, type: type[T], /, *, required: bool = ...) -> T | None: ...
+    def get_singleton(self, type: type[T], /, *, required: bool = ...) -> T | None: ...
 
     def get_singleton(self, type: type[T], /, *, required: bool = True) -> T | None:
         """Retrieves a singleton from the application.
@@ -237,10 +283,41 @@ class Application:
         """
         if type not in self._singletons:
             if required:
-                raise ValueError(f"Singleton not found: {type}")
+                raise ValueError(f"Singleton of type {type} not found")
             return None
 
-        return self._singletons[type]
+        singleton = self._singletons[type]
+
+        if isinstance(singleton, list):
+            raise ValueError(f"Multiple singletons of type {type} found")
+
+        return singleton
+
+    @overload
+    def get_singletons(self, type: type[T], /, *, required: Literal[True]) -> list[T]: ...
+
+    @overload
+    def get_singletons(self, type: type[T], /, *, required: bool = ...) -> list[T] | None: ...
+
+    def get_singletons(self, type: type[T], /, *, required: bool = True) -> list[T] | None:
+        """Retrieves all singletons of a type from the application.
+
+        Parameters
+        ----------
+        type: :class:`type`
+            The type of the singletons to retrieve.
+        """
+        if type not in self._singletons:
+            if required:
+                raise ValueError(f"Singletons of type {type} not found")
+            return None
+
+        singletons = self._singletons[type]
+
+        if not isinstance(singletons, list):
+            singletons = [singletons]
+
+        return singletons
 
     @overload
     def get_transient(self, type: type[T], /, *, required: Literal[True]) -> T: ...
@@ -373,45 +450,6 @@ class Application:
         self.add_service(cls, type=type)
         return cls
 
-    async def start(self, *, timeout: float | None = None) -> None:
-        """|coro|
-
-        Starts the application and all services.
-
-        Parameters
-        ----------
-        timeout: Optional[:class:`float`]
-            The maximum number of seconds to allow for all services to start.
-            If ``None``, no timeout is applied.
-
-        Raises
-        ------
-        asyncio.TimeoutError
-            A service did not start within the specified timeout.
-        """
-        async with self._lock:
-
-            if self._starting.is_set() or self._started.is_set():
-                raise RuntimeError("Application is already running")
-            elif self._stopping.is_set():  # Note: this shouldn't be possible
-                raise RuntimeError("Application is stopping")
-
-            self._starting.set()
-
-            coros = []
-            for service in self._services.values():
-                coros.append(service._start())
-
-            try:
-                await asyncio.wait_for(
-                    asyncio.gather(*coros), timeout=timeout
-                )  # TODO: Maybe timeout per service, allows for better debugging
-            finally:
-                self._starting.clear()
-
-            self._stopped.clear()
-            self._started.set()
-
     async def run(self, *, timeout: float | None = None) -> None:
         """|coro|
 
@@ -438,81 +476,3 @@ class Application:
             await self.stopped
         except asyncio.CancelledError as e:
             await self.stop()
-
-    async def stop(self) -> None:
-        """|coro|
-
-        Stops the application and all services.
-
-        .. Warning::
-
-            Exceptions raised by stopping services are discarded.
-        """
-        async with self._lock:
-
-            if not self._started.is_set():
-                raise RuntimeError("Application is not running")
-            elif self._stopping.is_set():
-                raise RuntimeError("Application is already stopping")
-            elif self._stopped.is_set():  # Note: this shouldn't be possible
-                raise RuntimeError("Application is already stopped")
-
-            self._stopping.set()
-
-            coros = []
-            for service in self._services.values():
-                coros.append(service._stop())
-
-            try:
-                await asyncio.gather(*coros)
-            finally:
-                self._stopping.clear()
-
-            self._started.clear()
-            self._stopped.set()
-
-    @property
-    def state(self) -> ApplicationState:
-        """The state of the application."""
-        if self._starting.is_set():
-            return ApplicationState.STARTING
-        elif self._stopping.is_set():
-            return ApplicationState.STOPPING
-        elif self._started.is_set():
-            return ApplicationState.STARTED
-        elif self._stopped.is_set():
-            return ApplicationState.STOPPED
-
-        return ApplicationState.UNKNOWN
-
-    @property
-    def starting(self) -> Awaitable[Literal[True]]:
-        """|coroprop|
-
-        An awaitable that resolves when the application is starting.
-        """
-        return self._starting.wait()
-
-    @property
-    def started(self) -> Awaitable[Literal[True]]:
-        """|coroprop|
-
-        An awaitable that resolves when the application has started.
-        """
-        return self._started.wait()
-
-    @property
-    def stopping(self) -> Awaitable[Literal[True]]:
-        """|coroprop|
-
-        An awaitable that resolves when the application is stopping.
-        """
-        return self._stopping.wait()
-
-    @property
-    def stopped(self) -> Awaitable[Literal[True]]:
-        """|coroprop|
-
-        An awaitable that resolves when the application has stopped.
-        """
-        return self._stopped.wait()

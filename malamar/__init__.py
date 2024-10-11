@@ -20,8 +20,8 @@ class _VersionInfo(NamedTuple):
     serial: int
 
 
-version: str = "0.1.0a"
-version_info: _VersionInfo = _VersionInfo(0, 1, 0, "alpha", 0)
+version: str = "0.1.1a"
+version_info: _VersionInfo = _VersionInfo(0, 1, 1, "alpha", 0)
 
 __all__ = [
     *_core_all,
