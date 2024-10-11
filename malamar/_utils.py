@@ -37,12 +37,8 @@ class _MissingSentinel:
 MISSING: Any = _MissingSentinel()
 
 
-def _bind_function(instance: T, func: Callable[Concatenate[T, P], R], *, name: str | None = None) -> Callable[P, R]:
-    if name is None:
-        name = func.__name__
-
+def _bind_function(instance: T, func: Callable[Concatenate[T, P], R]) -> Callable[P, R]:
     bound = func.__get__(instance, instance.__class__)
-    setattr(instance, name, bound)
     return bound
 
 

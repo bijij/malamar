@@ -119,14 +119,13 @@ class Service(metaclass=_ServiceMeta):
 
     def __init__(self):
         """Creates a new Service instance."""
-        print("Hello from Service", self)
         self._starting: asyncio.Event = asyncio.Event()
         self._started: asyncio.Event = asyncio.Event()
         self._stopping: asyncio.Event = asyncio.Event()
         self._stopped: asyncio.Event = asyncio.Event()
 
-        self.start = _bind_function(self, _start_service, name="start")
-        self.stop = _bind_function(self, _stop_service, name="stop")
+        self.start = _bind_function(self, _start_service)
+        self.stop = _bind_function(self, _stop_service)
 
         self._stopped.set()
 

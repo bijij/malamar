@@ -5,8 +5,9 @@ import builtins
 import inspect
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from contextvars import ContextVar
+from enum import Enum, auto
 from os import urandom
-from typing import TYPE_CHECKING, Any, Literal, NamedTuple, TypeVar, get_args, get_origin, get_type_hints, overload
+from typing import TYPE_CHECKING, Any, Generic, Literal, NamedTuple, TypeVar, get_args, get_origin, get_type_hints, overload
 
 from ._service import Service
 from ._utils import MISSING, _get_optional_type
@@ -20,11 +21,29 @@ T = TypeVar("T")
 T_SVC = TypeVar("T_SVC", bound=Service)
 
 
-class _Dependency(NamedTuple):
+class _Parameters(NamedTuple):
+    args: list[Any]
+    kwargs: dict[str, Any]
+
+
+class _Dependency(NamedTuple, Generic[T]):
     name: str | None
-    type: type | Sequence[type]
+    type: Sequence[type[T]]
     required: bool
     multiple: bool
+
+
+class _DependencyType(Enum):
+    SINGLETON = auto()
+    TRANSIENT = auto()
+    SCOPED = auto()
+    SERVICE = auto()
+
+
+class _UnresolvedDependency(NamedTuple, Generic[T]):
+    cls: type[T]
+    base: type[T]
+    type: _DependencyType
 
 
 def _get_dependencies(cls: type) -> Sequence[_Dependency]:
@@ -65,6 +84,9 @@ def _get_dependencies(cls: type) -> Sequence[_Dependency]:
         if parameter.kind is inspect.Parameter.KEYWORD_ONLY:
             name = parameter.name
 
+        if not isinstance(dependency, Sequence):
+            dependency = [dependency]
+
         dependencies.append(_Dependency(name, dependency, not optional, multiple))
 
     return dependencies
@@ -77,13 +99,16 @@ class Application(Service):
         """Creates a new Application instance."""
         super().__init__()
 
+        self._unresolved_dependencies: dict[type[Any], list[_UnresolvedDependency]] = {}
+
         self._singletons: dict[type[Any], Any | list[Any]] = {Application: self, type(self): self}
         self._transients: dict[type[Any], type[Any]] = {}
         self._scoped: dict[type[Any], type[Any]] = {}
+        self._services: dict[type[Service], Service] = {}
+
         self._contexts: ContextVar[dict[type[Any], Any]] = ContextVar(
             f"malamar.{self.__class__.__name__}.{urandom(16).hex()}.context", default={}
         )
-        self._services: dict[type[Service], Service] = {}
 
     async def start(self, *, timeout: float | None = None) -> None:
         """|coro|
@@ -101,6 +126,8 @@ class Application(Service):
         asyncio.TimeoutError
             A service did not start within the specified timeout.
         """
+        self._resolve_dependencies()
+
         coros = []
         for service in self._services.values():
             coros.append(service.start())
@@ -122,45 +149,67 @@ class Application(Service):
 
         await asyncio.gather(*coros)
 
-    def _resolve_dependency(self, type: type, multiple: bool) -> Any | None:
-        dependency = None
-        if type in self._singletons:
-            if multiple:
-                dependency = self.get_singletons(type)
-            else:
-                dependency = self.get_singleton(type)
-        elif type in self._transients:
-            dependency = self.get_transient(self._transients[type])
-        elif type in self._scoped:
-            dependency = self.get_scoped(type)
-        elif type in self._services:
-            dependency = self.get_service(type)
+    def _resolve_type(self, type: type[T]):
+        if type not in self._unresolved_dependencies:
+            return
 
+        for cls, base, dep_type in self._unresolved_dependencies.pop(type):
+
+            for dependency in _get_dependencies(cls):
+                for type in dependency.type:
+                    self._resolve_type(type)
+
+            instance, cls = self._create_instance(cls, base=base)
+
+            if dep_type is _DependencyType.SINGLETON:
+                self._register_singleton(base, instance)
+            elif dep_type is _DependencyType.TRANSIENT:
+                self._transients[base] = cls
+            elif dep_type is _DependencyType.SCOPED:
+                self._scoped[base] = cls
+            elif dep_type is _DependencyType.SERVICE:
+                self._services[base] = instance
+
+    def _resolve_dependencies(self):
+        while self._unresolved_dependencies:
+            self._resolve_type(next(iter(self._unresolved_dependencies)))
+
+    def _get_instance(self, types: Sequence[type], multiple: bool) -> Any | list[Any] | None:
+        dependency = None
+        for type in types:
+            if type in self._singletons:
+                if multiple:
+                    dependency = self.get_singletons(type)
+                else:
+                    dependency = self.get_singleton(type)
+            elif type in self._transients:
+                dependency = self.get_transient(self._transients[type])
+            elif type in self._scoped:
+                dependency = self.get_scoped(type)
+            elif type in self._services:
+                dependency = self.get_service(type)
+
+            if dependency is not None:
+                break
         return dependency
 
-    def _resolve_dependencies(self, types: Sequence[_Dependency]) -> tuple[Sequence[Any], Mapping[str, Any]]:
-        dependencies = ([], {})
-        for dependency in types:
-            name, idk, required, multiple = dependency
+    def _get_instances(self, dependencies: Sequence[_Dependency]) -> tuple[Sequence[Any], Mapping[str, Any]]:
+        resolved_dependencies = _Parameters([], {})
 
-            resolved = None
-            if not isinstance(idk, Sequence):
-                idk = [idk]
+        for dependency in dependencies:
+            name, types, required, multiple = dependency
 
-            for type in idk:
-                resolved = self._resolve_dependency(type, multiple=multiple)
-                if resolved is not None:
-                    break
-            else:
-                if required:
-                    raise ValueError(f"Required dependency not found: {dependency.type}")
+            resolved = self._get_instance(types, multiple=multiple)
+
+            if resolved is None and required:
+                raise ValueError(f"Required dependency not found: {dependency.type}")
 
             if name is None:
-                dependencies[0].append(resolved)
+                resolved_dependencies.args.append(resolved)
             else:
-                dependencies[1][name] = resolved
+                resolved_dependencies.kwargs[name] = resolved
 
-        return dependencies
+        return resolved_dependencies
 
     def _create_instance(
         self, cls: type[T] | T, *, type: type[T] | None = None, base: type[Any] | None = None
@@ -176,7 +225,7 @@ class Application(Service):
 
         if isinstance(cls, builtins.type):
             dependancies = _get_dependencies(cls)
-            args, kwargs = self._resolve_dependencies(dependancies)
+            args, kwargs = self._get_instances(dependancies)
             instance = cls(*args, **kwargs)
         else:
             instance = cls
@@ -185,6 +234,21 @@ class Application(Service):
             raise ValueError(f"Type {cls} is not a subclass of {type}")
 
         return instance, type  # type: ignore  # I've got no idea what the type-checker is thinking
+
+    def _add_dependency(self, dependency_type: _DependencyType, base: type[T], cls: type[T]):
+        if base not in self._unresolved_dependencies:
+            self._unresolved_dependencies[base] = []
+
+        self._unresolved_dependencies[base].append(_UnresolvedDependency(cls, base, dependency_type))
+
+    def _register_singleton(self, cls: type[T], instance: T) -> None:
+        if cls in self._singletons:
+            if isinstance(self._singletons[cls], list):
+                self._singletons[cls].append(instance)
+            else:
+                self._singletons[cls] = [self._singletons[cls], instance]
+        else:
+            self._singletons[cls] = instance
 
     @overload
     def add_singleton(self, cls: type[T], /, *, type: type[T] | None = ...) -> Self: ...
@@ -202,14 +266,10 @@ class Application(Service):
         type: Optional[:class:`type`]
             The type of the singleton. If not provided, the type of the class is used.
         """
-        instance, type = self._create_instance(cls, type=type)
-        if type in self._singletons:
-            if isinstance(self._singletons[type], list):
-                self._singletons[type].append(instance)
-            else:
-                self._singletons[type] = [self._singletons[type], instance]
+        if not isinstance(cls, builtins.type):
+            self._register_singleton(type or builtins.type(cls), cls)
         else:
-            self._singletons[type] = instance
+            self._add_dependency(_DependencyType.SINGLETON, type or cls, cls)
         return self
 
     def add_transient(self, cls: type, *, type: type | None = None) -> Self:
@@ -222,14 +282,7 @@ class Application(Service):
         type: Optional[:class:`type`]
             The type of the transient. If not provided, the type of the class is used.
         """
-        if type is None:
-            type = cls
-
-        if type in self._transients:
-            raise ValueError(f"Transient already exists: {type}")
-
-        self._resolve_dependencies(_get_dependencies(cls))
-        self._transients[type] = cls
+        self._add_dependency(_DependencyType.TRANSIENT, type or cls, cls)
         return self
 
     def add_scoped(self, cls: type, *, type: type | None = None) -> Self:
@@ -242,14 +295,7 @@ class Application(Service):
         type: Optional[:class:`type`]
             The type of the scoped. If not provided, the type of the class is used.
         """
-        if type is None:
-            type = cls
-
-        if type in self._scoped:
-            raise ValueError(f"Scoped already exists: {type}")
-
-        self._resolve_dependencies(_get_dependencies(cls))
-        self._scoped[type] = cls
+        self._add_dependency(_DependencyType.SCOPED, type or cls, cls)
         return self
 
     def add_service(self, cls: type[T_SVC] | T_SVC, *, type: type[T_SVC] | None = None) -> Self:
@@ -262,9 +308,10 @@ class Application(Service):
         type: Optional[:class:`type`]
             The type of the service. If not provided, the type of the class is used.
         """
-        instance, type = self._create_instance(cls, type=type, base=Service)
-        self._services[type] = instance
-        # instance._register()
+        if not isinstance(cls, builtins.type):
+            self._services[type or builtins.type(cls)] = cls
+        else:
+            self._add_dependency(_DependencyType.SERVICE, type or cls, cls)
         return self
 
     @overload
@@ -471,6 +518,13 @@ class Application(Service):
             A service did not start within the specified timeout.
         """
         await self.start(timeout=timeout)
+
+        print("Application started")
+        # from pprint import pprint
+        # pprint(self._singletons)
+        # pprint(self._transients)
+        # pprint(self._scoped)
+        # pprint(self._services)
 
         try:
             await self.stopped
